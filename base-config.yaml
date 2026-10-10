@@ -1,0 +1,29 @@
+# Discourse forum to watch (no trailing slash).
+base_url: https://community.nethserver.org
+# Matrix room that receives the forum. Every forum topic becomes a thread in
+# this room. Invite the bot first; it needs permission to send messages.
+room_id: ""
+# Seconds between checks for new posts (minimum 15).
+poll_interval: 60
+# What to post the first time the plugin runs for a room.
+backfill:
+  # Number of most recently active topics to mirror (0 = only new activity).
+  topics: 10
+  # Number of latest replies to post per backfilled topic (the first post of
+  # the topic is always included in the thread root).
+  posts_per_topic: 5
+# Category filter by slug or numeric id. A sub-category also matches its parent
+# category. Empty include list = all categories.
+categories:
+  include: []
+  exclude: []
+# Longer posts are cut and get a "read the full post" link.
+max_post_chars: 20000
+# Pages of 50 posts fetched per poll when catching up after downtime.
+max_pages_per_poll: 10
+# User-Agent sent to the forum.
+user_agent: maubot-discourse-watch (+https://github.com/Platypuschan/maubot-discourse-watch)
+# Command prefix, e.g. "!forum status".
+command_prefix: forum
+# Matrix user IDs allowed to run "!forum poll". Empty = everyone in the room.
+admins: []
