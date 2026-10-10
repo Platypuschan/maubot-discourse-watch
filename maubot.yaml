@@ -1,6 +1,7 @@
 maubot: 0.4.0
 id: io.github.platypuschan.discoursewatch
 version: 0.1.0
+license: MIT
 modules:
   - discourse_watch
 main_class: DiscourseWatchBot

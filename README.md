@@ -72,3 +72,9 @@ pip install maubot pytest pytest-asyncio aiosqlite
 python -m pytest tests
 mbc build
 ```
+
+## License
+
+[MIT](LICENSE): do whatever you like with the code. Have fun with it, and
+please don't use it for anything evil. (That last part is a wish, not a
+license condition.)
