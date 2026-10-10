@@ -54,6 +54,27 @@ Changing `room_id` starts a fresh mirror (with backfill) in the new room.
 * `!forum status` – forum, room, last processed post, number of mirrored topics,
   last poll and last error.
 * `!forum poll` – check for new posts now.
+* `!forum ignore [topic]` – stop mirroring a topic. Send it inside the topic's
+  thread, or give the topic id or forum URL.
+* `!forum unignore <topic>` – mirror an ignored topic again, starting with its
+  next new post (posts written in the meantime are not sent).
+* `!forum ignored` – list the ignored topics.
+
+`ignore` and `unignore` follow the `admins` setting, like `poll`.
+
+### Deleting a thread
+
+Deleting (redacting) a thread's first message in Matrix removes the whole
+thread and ignores its topic: the bot deletes the rest of the thread and sends
+no new posts of that topic any more.
+
+* Deleting the first message needs a power level that may delete other users'
+  messages, usually moderator or admin of the room.
+* The bot always deletes its own messages in the thread (forum posts, notices,
+  answers to commands). Replies written by other users are only deleted if the
+  bot itself has that power level in the room; otherwise they stay and the bot
+  logs how many it could not delete.
+* If you `unignore` such a topic later, its next post starts a new thread.
 
 ## Limitations
 

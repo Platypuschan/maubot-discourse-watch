@@ -2,7 +2,17 @@
 import asyncio
 
 import pytest
-from mautrix.types import EventID, RelationType
+from maubot.matrix import MaubotMessageEvent
+from maubot.testing.bot import make_message
+from mautrix.errors import MForbidden, MLimitExceeded
+from mautrix.types import (
+    EventID,
+    EventType,
+    RedactionEvent,
+    RedactionEventContent,
+    RelationType,
+    UserID,
+)
 
 from discourse_watch import bot as bot_module
 from discourse_watch.bot import Config, DiscourseWatchBot
@@ -72,4 +82,104 @@ async def test_plugin_polls_and_answers_status(forum, maubot_test_bot, maubot_pl
     await maubot_test_bot.send("!forum status", room_id=ROOM)
     status = maubot_test_bot.responded[-1].content.body
     assert "Last post id: 2" in status and "Mirrored topics: 1" in status
+    await maubot_plugin.stop()
+
+
+async def wait_synced(plugin):
+    for _ in range(50):
+        if await plugin.mirror.get_cursor() is not None:
+            return
+        await asyncio.sleep(0.01)
+
+
+def in_thread(bot, body, root):
+    evt = make_message(body, room_id=ROOM)
+    evt.content.set_thread_parent(root)
+    return MaubotMessageEvent(evt, bot.client)
+
+
+@pytest.mark.asyncio
+async def test_ignore_commands(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2), post(3, 200, 1))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    root100 = (await maubot_plugin.store.get_topic(ROOM, 100)).root_event_id
+
+    command = in_thread(maubot_test_bot, "!forum ignore", root100)
+    await maubot_test_bot.dispatch(EventType.ROOM_MESSAGE, command)
+    assert "Ignoring topic 100" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum ignore https://forum.example.org/t/x/200/3", room_id=ROOM)
+    assert "Ignoring topic 200" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum ignore", room_id=ROOM)
+    assert "Which topic?" in maubot_test_bot.responded[-1].content.body
+
+    await maubot_test_bot.send("!forum ignored", room_id=ROOM)
+    listing = maubot_test_bot.responded[-1].content.body
+    assert "Topic 100" in listing and "id 100" in listing and "id 200" in listing
+    assert "<li>" in maubot_test_bot.responded[-1].content.formatted_body
+
+    forum.add(post(4, 100, 3), post(5, 200, 2))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    assert "0 message(s) sent" in maubot_test_bot.responded[-1].content.body
+
+    await maubot_test_bot.send("!forum unignore 100", room_id=ROOM)
+    assert "mirrored again" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum status", room_id=ROOM)
+    assert "Ignored topics: 1" in maubot_test_bot.responded[-1].content.body
+    await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_redacting_thread_root_deletes_thread(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2), post(3, 100, 3), post(4, 200, 1))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    thread = await maubot_plugin.store.get_topic(ROOM, 100)
+    root = thread.root_event_id
+    own = set(await maubot_plugin.store.thread_events(ROOM, 100)) - {root}
+    assert len(own) == 2
+
+    # The homeserver also knows a user's reply and a command answer in the thread.
+    pages = [
+        {"chunk": [{"event_id": "$user-reply"}, {"event_id": sorted(own)[0]}], "next_batch": "b"},
+        {"chunk": [{"event_id": "$bot-answer"}]},
+    ]
+    requests = []
+
+    async def request(method, path, query_params=None, **kwargs):
+        requests.append((str(path), dict(query_params or {})))
+        return pages[len(requests) - 1]
+
+    redacted = []
+    limited = []
+
+    async def redact(room_id, event_id, reason=None, **kwargs):
+        if event_id == "$user-reply":
+            raise MForbidden(403, "not allowed")
+        if event_id == "$bot-answer" and not limited:
+            limited.append(event_id)
+            raise MLimitExceeded(429, "slow down")
+        redacted.append(event_id)
+        return EventID(f"$redaction-{event_id}")
+
+    maubot_test_bot.client.api.request = request
+    maubot_test_bot.client.redact = redact
+
+    redaction = RedactionEvent(
+        type=EventType.ROOM_REDACTION, room_id=ROOM, event_id=EventID("$redact"),
+        sender=UserID("@admin:example.com"), timestamp=0,
+        content=RedactionEventContent(), redacts=root,
+    )
+    await maubot_test_bot.dispatch(EventType.ROOM_REDACTION, redaction)
+    assert requests[0][0].endswith("/relations/" + root.replace("$", "%24") + "/m.thread")
+    assert requests[1][1]["from"] == "b"
+    assert set(redacted) == own | {"$bot-answer"}
+    assert limited == ["$bot-answer"]  # retried after the rate limit
+    assert root not in redacted
+    assert await maubot_plugin.store.is_ignored(ROOM, 100)
+    assert await maubot_plugin.store.get_topic(ROOM, 100) is None
+    assert await maubot_plugin.store.thread_events(ROOM, 100) == []
+    # The other topic is untouched.
+    assert await maubot_plugin.store.get_topic(ROOM, 200) is not None
+    assert len(await maubot_plugin.store.thread_events(ROOM, 200)) == 1
     await maubot_plugin.stop()

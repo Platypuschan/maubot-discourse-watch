@@ -200,3 +200,79 @@ def test_huge_post_is_shrunk_below_event_limit(tmp_path):
         await db.stop()
 
     asyncio.run(run())
+
+
+def test_parse_topic_ref():
+    from discourse_watch.mirror import parse_topic_ref
+
+    assert parse_topic_ref("123") == 123
+    assert parse_topic_ref("#123") == 123
+    assert parse_topic_ref(f"{BASE}/t/some-topic/123") == 123
+    assert parse_topic_ref(f"{BASE}/t/some-topic/123/4") == 123
+    assert parse_topic_ref(f"{BASE}/t/123/4") == 123
+    assert parse_topic_ref(f"{BASE}/u/someone") is None
+    assert parse_topic_ref("hello") is None
+
+
+def test_ignored_topic_is_skipped_until_unignored(tmp_path):
+    async def run():
+        db, forum, matrix, mirror = await make(tmp_path, backfill_topics=0)
+        forum.add(post(1, 100, 1))
+        await mirror.poll()
+        forum.add(post(2, 100, 2), post(3, 200, 1))
+        assert await mirror.poll() == 3  # header root + post 2, topic 200 root
+        root100 = matrix.sent[0][0]
+        assert await mirror.ignore(100) is True
+        assert await mirror.ignore(100) is False
+        forum.add(post(4, 100, 3), post(5, 200, 2))
+        assert await mirror.poll() == 1
+        assert "post 5" in matrix.sent[-1][1].body
+        assert await mirror.get_cursor() == 5
+        assert await mirror.store.ignored_topics(ROOM) == [(100, "Topic 100")]
+        # Unignore resumes in the existing thread with new posts only.
+        assert await mirror.unignore(100) is True
+        assert await mirror.unignore(100) is False
+        forum.add(post(6, 100, 4))
+        assert await mirror.poll() == 1
+        assert thread_of(matrix.sent[-1][1]) == root100 and "post 6" in matrix.sent[-1][1].body
+        assert not any("post 4" in c.body for _, c in matrix.sent)
+        await db.stop()
+
+    asyncio.run(run())
+
+
+def test_deleted_thread_root_ignores_topic(tmp_path):
+    async def run():
+        db, forum, matrix, mirror = await make(tmp_path, backfill_topics=0)
+        forum.add(post(1, 100, 1))
+        await mirror.poll()
+        forum.add(post(2, 200, 1), post(3, 200, 2))
+        await mirror.poll()
+        root, reply = matrix.sent[0][0], matrix.sent[1][0]
+        assert await mirror.root_redacted(reply) is None  # deleting a reply changes nothing
+        thread = await mirror.root_redacted(root)
+        assert thread.topic_id == 200
+        assert await mirror.store.is_ignored(ROOM, 200)
+        forum.add(post(4, 200, 3))
+        assert await mirror.poll() == 0
+        # After unignore the topic gets a new thread, not the deleted root.
+        await mirror.unignore(200)
+        forum.add(post(5, 200, 4))
+        assert await mirror.poll() == 2
+        new_root = matrix.sent[-2][0]
+        assert new_root != root and thread_of(matrix.sent[-1][1]) == new_root
+        await db.stop()
+
+    asyncio.run(run())
+
+
+def test_backfill_skips_ignored_topics(tmp_path):
+    async def run():
+        db, forum, matrix, mirror = await make(tmp_path, backfill_topics=5)
+        forum.add(post(1, 100, 1), post(2, 200, 1))
+        await mirror.store.ignore_topic(ROOM, 200, "")
+        await mirror.poll()
+        assert [c.body.splitlines()[0] for _, c in matrix.sent] == ["📌 Topic 100"]
+        await db.stop()
+
+    asyncio.run(run())
