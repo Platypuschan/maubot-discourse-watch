@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install maubot
+        run: pip install maubot pytest pytest-asyncio aiosqlite
+      - name: Tests
+        run: python -m pytest -v -p no:cacheprovider tests
+      - name: Build plugin
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          find . -name __pycache__ -prune -exec rm -rf {} +
+          mkdir -p dist
+          mbc build -o dist
+          unzip -l dist/*.mbp
+      - uses: actions/upload-artifact@v7
+        with:
+          name: maubot-plugin
+          path: dist/*.mbp
+          if-no-files-found: error
