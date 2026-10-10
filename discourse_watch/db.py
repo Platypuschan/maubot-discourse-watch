@@ -48,6 +48,18 @@ async def upgrade_v2(conn: Connection) -> None:
     )
 
 
+@upgrade_table.register(description="Events sent into threads")
+async def upgrade_v3(conn: Connection) -> None:
+    await conn.execute(
+        """CREATE TABLE thread_event (
+            room_id  TEXT   NOT NULL,
+            topic_id BIGINT NOT NULL,
+            event_id TEXT   NOT NULL,
+            PRIMARY KEY (room_id, event_id)
+        )"""
+    )
+
+
 @dataclass
 class TopicThread:
     room_id: RoomID
@@ -161,3 +173,25 @@ class Store:
             room_id,
         )
         return [(row["topic_id"], row["title"]) for row in rows]
+
+    async def add_thread_event(self, room_id: RoomID, topic_id: int, event_id: EventID) -> None:
+        await self.db.execute(
+            "INSERT INTO thread_event (room_id, topic_id, event_id) VALUES ($1, $2, $3) "
+            "ON CONFLICT (room_id, event_id) DO NOTHING",
+            room_id,
+            topic_id,
+            event_id,
+        )
+
+    async def thread_events(self, room_id: RoomID, topic_id: int) -> list[EventID]:
+        rows = await self.db.fetch(
+            "SELECT event_id FROM thread_event WHERE room_id=$1 AND topic_id=$2",
+            room_id,
+            topic_id,
+        )
+        return [EventID(row["event_id"]) for row in rows]
+
+    async def forget_thread_events(self, room_id: RoomID, topic_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM thread_event WHERE room_id=$1 AND topic_id=$2", room_id, topic_id
+        )

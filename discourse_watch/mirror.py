@@ -171,7 +171,7 @@ class Mirror:
         """A thread root was deleted in Matrix: ignore its topic and forget the thread.
 
         Forgetting it means a later unignore starts a new thread instead of
-        replying to the deleted root.
+        replying to the deleted root. The caller deletes the rest of the thread.
         """
         thread = await self.thread_of_event(event_id)
         if thread is None:
@@ -204,6 +204,7 @@ class Mirror:
         event_id = await self.send(self.settings.room_id, content)
         thread = TopicThread(self.settings.room_id, topic.id, event_id, event_id, topic.title)
         await self.store.put_topic(thread)
+        await self.store.add_thread_event(thread.room_id, topic.id, event_id)
         if first:
             await self.store.mark_sent(self.settings.room_id, first.id, event_id)
         return thread
@@ -240,6 +241,7 @@ class Mirror:
     async def send_in_thread(self, thread: TopicThread, content: TextMessageEventContent) -> None:
         content.set_thread_parent(thread.root_event_id, last_event_in_thread=thread.last_event_id)
         thread.last_event_id = await self.send(thread.room_id, content)
+        await self.store.add_thread_event(thread.room_id, thread.topic_id, thread.last_event_id)
         await self.store.put_topic(thread)
 
     def post_body(self, post: Post) -> tuple[str, str]:

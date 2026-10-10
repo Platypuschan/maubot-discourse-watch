@@ -7,19 +7,22 @@ from typing import Type
 
 from maubot import MessageEvent, Plugin
 from maubot.handlers import command, event
+from mautrix.api import Method, Path
+from mautrix.errors import MForbidden, MLimitExceeded
 from mautrix.types import (
     EventID,
     EventType,
     Format,
     MessageType,
     RedactionEvent,
+    RelationType,
     RoomID,
     TextMessageEventContent,
 )
 from mautrix.util.async_db import UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
-from .db import Store, upgrade_table
+from .db import Store, TopicThread, upgrade_table
 from .discourse import DiscourseClient
 from .mirror import Mirror, MirrorSettings, parse_topic_ref
 
@@ -272,3 +275,58 @@ class DiscourseWatchBot(Plugin):
             self.log.info(
                 f"Thread root of topic {thread.topic_id} deleted by {evt.sender}, topic ignored"
             )
+            await self.delete_thread(thread)
+
+    async def thread_relations(self, room_id: RoomID, root: EventID) -> set[EventID]:
+        """All events the homeserver knows in the thread of ``root``."""
+        path = Path.v1.rooms[room_id].relations[root][RelationType.THREAD.value]
+        events: set[EventID] = set()
+        params = {"limit": "100"}
+        for _ in range(100):
+            data = await self.client.api.request(Method.GET, path, query_params=params)
+            events.update(EventID(e["event_id"]) for e in data.get("chunk", []) if "event_id" in e)
+            if not data.get("next_batch"):
+                break
+            params["from"] = data["next_batch"]
+        return events
+
+    async def redact(self, room_id: RoomID, event_id: EventID, attempts: int = 5) -> None:
+        """Delete one event, backing off on the homeserver's rate limit (mautrix doesn't)."""
+        for attempt in range(attempts):
+            try:
+                await self.client.redact(room_id, event_id, reason="Forum thread deleted")
+                return
+            except MLimitExceeded:
+                if attempt == attempts - 1:
+                    raise
+                # mautrix drops the response body, so retry_after_ms is not available.
+                await asyncio.sleep(2**attempt)
+
+    async def delete_thread(self, thread: TopicThread) -> None:
+        """Delete the remaining messages of a thread whose root was deleted.
+
+        The bot can always delete its own messages; other users' replies need a
+        power level that allows deleting them.
+        """
+        events = set(await self.store.thread_events(thread.room_id, thread.topic_id))
+        try:
+            events |= await self.thread_relations(thread.room_id, thread.root_event_id)
+        except Exception as e:
+            self.log.warning(f"Could not list thread of topic {thread.topic_id}: {e}")
+        events.discard(thread.root_event_id)
+        deleted = forbidden = failed = 0
+        for event_id in sorted(events):
+            try:
+                await self.redact(thread.room_id, event_id)
+                deleted += 1
+            except MForbidden:
+                forbidden += 1
+            except Exception as e:
+                failed += 1
+                self.log.warning(f"Could not delete {event_id}: {e}")
+        await self.store.forget_thread_events(thread.room_id, thread.topic_id)
+        self.log.info(
+            f"Deleted {deleted} message(s) of topic {thread.topic_id}"
+            + (f", {forbidden} not allowed (bot lacks power level)" if forbidden else "")
+            + (f", {failed} failed" if failed else "")
+        )

@@ -4,6 +4,7 @@ import asyncio
 import pytest
 from maubot.matrix import MaubotMessageEvent
 from maubot.testing.bot import make_message
+from mautrix.errors import MForbidden, MLimitExceeded
 from mautrix.types import (
     EventID,
     EventType,
@@ -129,11 +130,40 @@ async def test_ignore_commands(forum, maubot_test_bot, maubot_plugin):
 
 
 @pytest.mark.asyncio
-async def test_redacting_thread_root_ignores_topic(forum, maubot_test_bot, maubot_plugin):
+async def test_redacting_thread_root_deletes_thread(forum, maubot_test_bot, maubot_plugin):
     await wait_synced(maubot_plugin)
-    forum.add(post(2, 100, 2))
+    forum.add(post(2, 100, 2), post(3, 100, 3), post(4, 200, 1))
     await maubot_test_bot.send("!forum poll", room_id=ROOM)
-    root = (await maubot_plugin.store.get_topic(ROOM, 100)).root_event_id
+    thread = await maubot_plugin.store.get_topic(ROOM, 100)
+    root = thread.root_event_id
+    own = set(await maubot_plugin.store.thread_events(ROOM, 100)) - {root}
+    assert len(own) == 2
+
+    # The homeserver also knows a user's reply and a command answer in the thread.
+    pages = [
+        {"chunk": [{"event_id": "$user-reply"}, {"event_id": sorted(own)[0]}], "next_batch": "b"},
+        {"chunk": [{"event_id": "$bot-answer"}]},
+    ]
+    requests = []
+
+    async def request(method, path, query_params=None, **kwargs):
+        requests.append((str(path), dict(query_params or {})))
+        return pages[len(requests) - 1]
+
+    redacted = []
+    limited = []
+
+    async def redact(room_id, event_id, reason=None, **kwargs):
+        if event_id == "$user-reply":
+            raise MForbidden(403, "not allowed")
+        if event_id == "$bot-answer" and not limited:
+            limited.append(event_id)
+            raise MLimitExceeded(429, "slow down")
+        redacted.append(event_id)
+        return EventID(f"$redaction-{event_id}")
+
+    maubot_test_bot.client.api.request = request
+    maubot_test_bot.client.redact = redact
 
     redaction = RedactionEvent(
         type=EventType.ROOM_REDACTION, room_id=ROOM, event_id=EventID("$redact"),
@@ -141,6 +171,15 @@ async def test_redacting_thread_root_ignores_topic(forum, maubot_test_bot, maubo
         content=RedactionEventContent(), redacts=root,
     )
     await maubot_test_bot.dispatch(EventType.ROOM_REDACTION, redaction)
+    assert requests[0][0].endswith("/relations/" + root.replace("$", "%24") + "/m.thread")
+    assert requests[1][1]["from"] == "b"
+    assert set(redacted) == own | {"$bot-answer"}
+    assert limited == ["$bot-answer"]  # retried after the rate limit
+    assert root not in redacted
     assert await maubot_plugin.store.is_ignored(ROOM, 100)
     assert await maubot_plugin.store.get_topic(ROOM, 100) is None
+    assert await maubot_plugin.store.thread_events(ROOM, 100) == []
+    # The other topic is untouched.
+    assert await maubot_plugin.store.get_topic(ROOM, 200) is not None
+    assert len(await maubot_plugin.store.thread_events(ROOM, 200)) == 1
     await maubot_plugin.stop()
