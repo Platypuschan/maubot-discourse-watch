@@ -28,6 +28,13 @@ default; after downtime it catches up on missed posts (up to
    client and set `room_id` in its configuration (the room's internal ID,
    `!…:server`, found under *Room settings → Advanced* in Element).
 
+Homeservers limit how fast a user may send messages (Synapse by default: a
+burst of 10, then about one every 5 seconds). The backfill on the first start
+can hit that limit; the bot then waits and retries, so the first start may take
+a few minutes. On Synapse, a server admin can lift the limit for the bot with
+the admin API `POST /_synapse/admin/v1/users/<bot user id>/override_ratelimit`
+and `{"messages_per_second": 0, "burst_count": 0}`.
+
 The plugin needs maubot ≥ 0.4 and stores its state in the instance database
 (SQLite or PostgreSQL).
 
