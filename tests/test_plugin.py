@@ -204,3 +204,37 @@ async def test_send_waits_out_rate_limit(forum, maubot_test_bot, maubot_plugin):
     assert sent == 2 and len(failures) == 3
     assert maubot_plugin.last_error is None
     await maubot_plugin.stop()
+
+
+def link_previews(event):
+    return event.content.serialize().get("com.beeper.linkpreviews")
+
+
+@pytest.mark.asyncio
+async def test_messages_opt_out_of_url_previews(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    await maubot_test_bot.send("!forum status", room_id=ROOM)
+    assert len(maubot_test_bot.responded) == 4  # root, post, poll answer, status
+    assert all(link_previews(e) == [] for e in maubot_test_bot.responded)
+    await maubot_plugin.stop()
+
+
+class TestUrlPreviewsEnabled:
+    @pytest.fixture
+    def maubot_plugin_config_overrides(self):
+        return {
+            "room_id": ROOM,
+            "backfill": {"topics": 0, "posts_per_topic": 0},
+            "url_previews": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_opt_out(self, forum, maubot_test_bot, maubot_plugin):
+        await wait_synced(maubot_plugin)
+        forum.add(post(2, 100, 2))
+        await maubot_test_bot.send("!forum poll", room_id=ROOM)
+        assert len(maubot_test_bot.responded) == 3
+        assert all(link_previews(e) is None for e in maubot_test_bot.responded)
+        await maubot_plugin.stop()

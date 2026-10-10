@@ -53,6 +53,7 @@ The plugin needs maubot ≥ 0.4 and stores its state in the instance database
 | `user_agent` | `maubot-discourse-watch (…)` | User-Agent sent to the forum |
 | `command_prefix` | `forum` | Prefix for the bot commands |
 | `admins` | `[]` | Matrix IDs allowed to run `!forum poll` (empty = everyone) |
+| `url_previews` | `false` | Show URL previews for the bot's messages. When `false`, messages carry the [MSC4095](https://github.com/matrix-org/matrix-spec-proposals/pull/4095) opt-out (`"com.beeper.linkpreviews": []`): Element 1.12.30 and later shows no previews for them, for everyone in the room. Other clients may ignore it. Only affects messages sent after the change. |
 
 Changing `room_id` starts a fresh mirror (with backfill) in the new room.
 

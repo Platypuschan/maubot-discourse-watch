@@ -29,6 +29,10 @@ from .mirror import Mirror, MirrorSettings, parse_topic_ref
 
 T = TypeVar("T")
 
+# MSC4095: an empty list of bundled link previews tells clients (Element ≥ 1.12.30)
+# not to show URL previews for the message.
+LINK_PREVIEWS = "com.beeper.linkpreviews"
+
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
@@ -44,6 +48,7 @@ class Config(BaseProxyConfig):
         helper.copy("user_agent")
         helper.copy("command_prefix")
         helper.copy("admins")
+        helper.copy("url_previews")
 
 
 class DiscourseWatchBot(Plugin):
@@ -123,8 +128,18 @@ class DiscourseWatchBot(Plugin):
                 await asyncio.sleep(min(2**attempt, 30) * self.backoff_unit)
         raise AssertionError("unreachable")
 
+    @property
+    def no_previews(self) -> dict[str, list]:
+        """Extra event content that turns off URL previews, unless enabled in the config."""
+        return {} if self.config["url_previews"] else {LINK_PREVIEWS: []}
+
     async def send_message(self, room_id: RoomID, content: TextMessageEventContent) -> EventID:
+        for key, value in self.no_previews.items():
+            content[key] = value
         return await self.rate_limited(lambda: self.client.send_message(room_id, content))
+
+    async def reply(self, evt: MessageEvent, content: str | TextMessageEventContent) -> EventID:
+        return await evt.reply(content, extra_content=self.no_previews)
 
     async def poll_loop(self) -> None:
         while True:
@@ -165,7 +180,7 @@ class DiscourseWatchBot(Plugin):
     @forum.subcommand("status", help="Show the mirror status")
     async def status(self, evt: MessageEvent) -> None:
         if self.mirror is None:
-            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            await self.reply(evt, "Not configured: set `room_id` in the plugin config.")
             return
         cursor = await self.mirror.get_cursor()
         topics = await self.store.count_topics(self.mirror.settings.room_id)
@@ -185,18 +200,18 @@ class DiscourseWatchBot(Plugin):
         ]
         if self.last_error:
             lines.append(f"Last error: {self.last_error}")
-        await evt.reply("\n".join(f"* {line}" for line in lines))
+        await self.reply(evt, "\n".join(f"* {line}" for line in lines))
 
     @forum.subcommand("poll", help="Check the forum for new posts now")
     async def poll(self, evt: MessageEvent) -> None:
         if not self.is_admin(evt):
-            await evt.reply("You are not allowed to do that.")
+            await self.reply(evt, "You are not allowed to do that.")
             return
         sent = await self.poll_now()
         if self.last_error:
-            await evt.reply(f"Poll failed: {self.last_error}")
+            await self.reply(evt, f"Poll failed: {self.last_error}")
         else:
-            await evt.reply(f"Poll done, {sent} message(s) sent.")
+            await self.reply(evt, f"Poll done, {sent} message(s) sent.")
 
     async def topic_from_command(self, evt: MessageEvent, value: str) -> int | None:
         """Topic named in the command, or the topic of the thread it was sent in."""
@@ -213,58 +228,61 @@ class DiscourseWatchBot(Plugin):
     @command.argument("topic", required=False, pass_raw=True)
     async def ignore(self, evt: MessageEvent, topic: str) -> None:
         if self.mirror is None:
-            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            await self.reply(evt, "Not configured: set `room_id` in the plugin config.")
             return
         if not self.is_admin(evt):
-            await evt.reply("You are not allowed to do that.")
+            await self.reply(evt, "You are not allowed to do that.")
             return
         topic_id = await self.topic_from_command(evt, topic or "")
         if topic_id is None:
-            await evt.reply(
+            await self.reply(
+                evt,
                 "Which topic? Send the command in the topic's thread, or give its id or URL."
             )
             return
         async with self.poll_lock:
             added = await self.mirror.ignore(topic_id)
         if added:
-            await evt.reply(
+            await self.reply(
+                evt,
                 f"Ignoring topic {topic_id}. Undo with `!{self.config['command_prefix']} "
                 f"unignore {topic_id}`."
             )
         else:
-            await evt.reply(f"Topic {topic_id} is already ignored.")
+            await self.reply(evt, f"Topic {topic_id} is already ignored.")
 
     @forum.subcommand("unignore", help="Mirror an ignored topic again")
     @command.argument("topic", required=False, pass_raw=True)
     async def unignore(self, evt: MessageEvent, topic: str) -> None:
         if self.mirror is None:
-            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            await self.reply(evt, "Not configured: set `room_id` in the plugin config.")
             return
         if not self.is_admin(evt):
-            await evt.reply("You are not allowed to do that.")
+            await self.reply(evt, "You are not allowed to do that.")
             return
         topic_id = await self.topic_from_command(evt, topic or "")
         if topic_id is None:
-            await evt.reply("Which topic? Give its id or URL (see `ignored`).")
+            await self.reply(evt, "Which topic? Give its id or URL (see `ignored`).")
             return
         async with self.poll_lock:
             removed = await self.mirror.unignore(topic_id)
         if removed:
-            await evt.reply(
+            await self.reply(
+                evt,
                 f"Topic {topic_id} is mirrored again from its next new post "
                 "(posts written while it was ignored are not sent)."
             )
         else:
-            await evt.reply(f"Topic {topic_id} is not ignored.")
+            await self.reply(evt, f"Topic {topic_id} is not ignored.")
 
     @forum.subcommand("ignored", help="List the ignored topics")
     async def ignored(self, evt: MessageEvent) -> None:
         if self.mirror is None:
-            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            await self.reply(evt, "Not configured: set `room_id` in the plugin config.")
             return
         topics = await self.store.ignored_topics(self.mirror.settings.room_id)
         if not topics:
-            await evt.reply("No topics are ignored.")
+            await self.reply(evt, "No topics are ignored.")
             return
         # Forum titles go into HTML, not Markdown, so brackets or asterisks stay text.
         items_html, items_text = [], []
@@ -274,7 +292,8 @@ class DiscourseWatchBot(Plugin):
             link = f'<a href="{escape(url)}">{escape(title)}</a>'
             items_html.append(f"<li>{link} – id {topic_id}</li>")
             items_text.append(f"* {title} – id {topic_id} {url}")
-        await evt.reply(
+        await self.reply(
+            evt,
             TextMessageEventContent(
                 msgtype=MessageType.NOTICE,
                 body="Ignored topics:\n" + "\n".join(items_text),

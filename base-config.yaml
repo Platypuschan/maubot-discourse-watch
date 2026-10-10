@@ -27,3 +27,7 @@ user_agent: maubot-discourse-watch (+https://github.com/Platypuschan/maubot-disc
 command_prefix: forum
 # Matrix user IDs allowed to run "!forum poll". Empty = everyone in the room.
 admins: []
+# Show URL previews for the bot's messages. When false, every message carries the
+# MSC4095 opt-out ("com.beeper.linkpreviews": []), so Element (1.12.30 and later)
+# shows no previews in the room. Clients without MSC4095 support ignore it.
+url_previews: false
