@@ -2,7 +2,16 @@
 import asyncio
 
 import pytest
-from mautrix.types import EventID, RelationType
+from maubot.matrix import MaubotMessageEvent
+from maubot.testing.bot import make_message
+from mautrix.types import (
+    EventID,
+    EventType,
+    RedactionEvent,
+    RedactionEventContent,
+    RelationType,
+    UserID,
+)
 
 from discourse_watch import bot as bot_module
 from discourse_watch.bot import Config, DiscourseWatchBot
@@ -72,4 +81,66 @@ async def test_plugin_polls_and_answers_status(forum, maubot_test_bot, maubot_pl
     await maubot_test_bot.send("!forum status", room_id=ROOM)
     status = maubot_test_bot.responded[-1].content.body
     assert "Last post id: 2" in status and "Mirrored topics: 1" in status
+    await maubot_plugin.stop()
+
+
+async def wait_synced(plugin):
+    for _ in range(50):
+        if await plugin.mirror.get_cursor() is not None:
+            return
+        await asyncio.sleep(0.01)
+
+
+def in_thread(bot, body, root):
+    evt = make_message(body, room_id=ROOM)
+    evt.content.set_thread_parent(root)
+    return MaubotMessageEvent(evt, bot.client)
+
+
+@pytest.mark.asyncio
+async def test_ignore_commands(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2), post(3, 200, 1))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    root100 = (await maubot_plugin.store.get_topic(ROOM, 100)).root_event_id
+
+    command = in_thread(maubot_test_bot, "!forum ignore", root100)
+    await maubot_test_bot.dispatch(EventType.ROOM_MESSAGE, command)
+    assert "Ignoring topic 100" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum ignore https://forum.example.org/t/x/200/3", room_id=ROOM)
+    assert "Ignoring topic 200" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum ignore", room_id=ROOM)
+    assert "Which topic?" in maubot_test_bot.responded[-1].content.body
+
+    await maubot_test_bot.send("!forum ignored", room_id=ROOM)
+    listing = maubot_test_bot.responded[-1].content.body
+    assert "Topic 100" in listing and "id 100" in listing and "id 200" in listing
+    assert "<li>" in maubot_test_bot.responded[-1].content.formatted_body
+
+    forum.add(post(4, 100, 3), post(5, 200, 2))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    assert "0 message(s) sent" in maubot_test_bot.responded[-1].content.body
+
+    await maubot_test_bot.send("!forum unignore 100", room_id=ROOM)
+    assert "mirrored again" in maubot_test_bot.responded[-1].content.body
+    await maubot_test_bot.send("!forum status", room_id=ROOM)
+    assert "Ignored topics: 1" in maubot_test_bot.responded[-1].content.body
+    await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_redacting_thread_root_ignores_topic(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    root = (await maubot_plugin.store.get_topic(ROOM, 100)).root_event_id
+
+    redaction = RedactionEvent(
+        type=EventType.ROOM_REDACTION, room_id=ROOM, event_id=EventID("$redact"),
+        sender=UserID("@admin:example.com"), timestamp=0,
+        content=RedactionEventContent(), redacts=root,
+    )
+    await maubot_test_bot.dispatch(EventType.ROOM_REDACTION, redaction)
+    assert await maubot_plugin.store.is_ignored(ROOM, 100)
+    assert await maubot_plugin.store.get_topic(ROOM, 100) is None
     await maubot_plugin.stop()

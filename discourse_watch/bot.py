@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import time
+from html import escape
 from typing import Type
 
 from maubot import MessageEvent, Plugin
-from maubot.handlers import command
-from mautrix.types import EventID, RoomID, TextMessageEventContent
+from maubot.handlers import command, event
+from mautrix.types import (
+    EventID,
+    EventType,
+    Format,
+    MessageType,
+    RedactionEvent,
+    RoomID,
+    TextMessageEventContent,
+)
 from mautrix.util.async_db import UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .db import Store, upgrade_table
 from .discourse import DiscourseClient
-from .mirror import Mirror, MirrorSettings
+from .mirror import Mirror, MirrorSettings, parse_topic_ref
 
 
 class Config(BaseProxyConfig):
@@ -137,6 +146,7 @@ class DiscourseWatchBot(Plugin):
             return
         cursor = await self.mirror.get_cursor()
         topics = await self.store.count_topics(self.mirror.settings.room_id)
+        ignored = await self.store.ignored_topics(self.mirror.settings.room_id)
         last = (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.last_poll))
             if self.last_poll
@@ -147,6 +157,7 @@ class DiscourseWatchBot(Plugin):
             f"Room: {self.mirror.settings.room_id}",
             f"Last post id: {cursor if cursor is not None else 'not synced yet'}",
             f"Mirrored topics: {topics}",
+            f"Ignored topics: {len(ignored)}",
             f"Last poll: {last}",
         ]
         if self.last_error:
@@ -163,3 +174,101 @@ class DiscourseWatchBot(Plugin):
             await evt.reply(f"Poll failed: {self.last_error}")
         else:
             await evt.reply(f"Poll done, {sent} message(s) sent.")
+
+    async def topic_from_command(self, evt: MessageEvent, value: str) -> int | None:
+        """Topic named in the command, or the topic of the thread it was sent in."""
+        if value.strip():
+            return parse_topic_ref(value)
+        for event_id in (evt.content.get_thread_parent(), evt.content.get_reply_to()):
+            if event_id:
+                thread = await self.mirror.thread_of_event(event_id)
+                if thread:
+                    return thread.topic_id
+        return None
+
+    @forum.subcommand("ignore", help="Stop mirroring a topic (send in its thread, or give id/URL)")
+    @command.argument("topic", required=False, pass_raw=True)
+    async def ignore(self, evt: MessageEvent, topic: str) -> None:
+        if self.mirror is None:
+            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            return
+        if not self.is_admin(evt):
+            await evt.reply("You are not allowed to do that.")
+            return
+        topic_id = await self.topic_from_command(evt, topic or "")
+        if topic_id is None:
+            await evt.reply(
+                "Which topic? Send the command in the topic's thread, or give its id or URL."
+            )
+            return
+        async with self.poll_lock:
+            added = await self.mirror.ignore(topic_id)
+        if added:
+            await evt.reply(
+                f"Ignoring topic {topic_id}. Undo with `!{self.config['command_prefix']} "
+                f"unignore {topic_id}`."
+            )
+        else:
+            await evt.reply(f"Topic {topic_id} is already ignored.")
+
+    @forum.subcommand("unignore", help="Mirror an ignored topic again")
+    @command.argument("topic", required=False, pass_raw=True)
+    async def unignore(self, evt: MessageEvent, topic: str) -> None:
+        if self.mirror is None:
+            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            return
+        if not self.is_admin(evt):
+            await evt.reply("You are not allowed to do that.")
+            return
+        topic_id = await self.topic_from_command(evt, topic or "")
+        if topic_id is None:
+            await evt.reply("Which topic? Give its id or URL (see `ignored`).")
+            return
+        async with self.poll_lock:
+            removed = await self.mirror.unignore(topic_id)
+        if removed:
+            await evt.reply(
+                f"Topic {topic_id} is mirrored again from its next new post "
+                "(posts written while it was ignored are not sent)."
+            )
+        else:
+            await evt.reply(f"Topic {topic_id} is not ignored.")
+
+    @forum.subcommand("ignored", help="List the ignored topics")
+    async def ignored(self, evt: MessageEvent) -> None:
+        if self.mirror is None:
+            await evt.reply("Not configured: set `room_id` in the plugin config.")
+            return
+        topics = await self.store.ignored_topics(self.mirror.settings.room_id)
+        if not topics:
+            await evt.reply("No topics are ignored.")
+            return
+        # Forum titles go into HTML, not Markdown, so brackets or asterisks stay text.
+        items_html, items_text = [], []
+        for topic_id, title in topics:
+            title = title or f"Topic {topic_id}"
+            url = self.mirror.client.topic_url(topic_id)
+            link = f'<a href="{escape(url)}">{escape(title)}</a>'
+            items_html.append(f"<li>{link} – id {topic_id}</li>")
+            items_text.append(f"* {title} – id {topic_id} {url}")
+        await evt.reply(
+            TextMessageEventContent(
+                msgtype=MessageType.NOTICE,
+                body="Ignored topics:\n" + "\n".join(items_text),
+                format=Format.HTML,
+                formatted_body=f"<p>Ignored topics:</p><ul>{''.join(items_html)}</ul>",
+            )
+        )
+
+    @event.on(EventType.ROOM_REDACTION)
+    async def on_redaction(self, evt: RedactionEvent) -> None:
+        """Deleting a thread root in Matrix ignores that topic."""
+        mirror = self.mirror
+        if mirror is None or evt.room_id != mirror.settings.room_id or not evt.redacts:
+            return
+        async with self.poll_lock:
+            thread = await mirror.root_redacted(evt.redacts)
+        if thread:
+            self.log.info(
+                f"Thread root of topic {thread.topic_id} deleted by {evt.sender}, topic ignored"
+            )

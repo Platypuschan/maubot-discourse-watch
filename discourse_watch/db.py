@@ -36,6 +36,18 @@ async def upgrade_v1(conn: Connection) -> None:
     )
 
 
+@upgrade_table.register(description="Ignored topics")
+async def upgrade_v2(conn: Connection) -> None:
+    await conn.execute(
+        """CREATE TABLE ignored_topic (
+            room_id  TEXT   NOT NULL,
+            topic_id BIGINT NOT NULL,
+            title    TEXT   NOT NULL,
+            PRIMARY KEY (room_id, topic_id)
+        )"""
+    )
+
+
 @dataclass
 class TopicThread:
     room_id: RoomID
@@ -82,6 +94,20 @@ class Store:
             thread.title,
         )
 
+    async def get_topic_by_root(self, room_id: RoomID, event_id: EventID) -> TopicThread | None:
+        row = await self.db.fetchrow(
+            "SELECT room_id, topic_id, root_event_id, last_event_id, title FROM topic "
+            "WHERE room_id=$1 AND root_event_id=$2",
+            room_id,
+            event_id,
+        )
+        return TopicThread(**row) if row else None
+
+    async def delete_topic(self, room_id: RoomID, topic_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM topic WHERE room_id=$1 AND topic_id=$2", room_id, topic_id
+        )
+
     async def count_topics(self, room_id: RoomID) -> int:
         return await self.db.fetchval("SELECT COUNT(*) FROM topic WHERE room_id=$1", room_id)
 
@@ -100,3 +126,38 @@ class Store:
             post_id,
             event_id,
         )
+
+    async def is_ignored(self, room_id: RoomID, topic_id: int) -> bool:
+        return bool(
+            await self.db.fetchval(
+                "SELECT 1 FROM ignored_topic WHERE room_id=$1 AND topic_id=$2", room_id, topic_id
+            )
+        )
+
+    async def ignore_topic(self, room_id: RoomID, topic_id: int, title: str) -> bool:
+        """Add ``topic_id`` to the ignore list; return False if it was already there."""
+        if await self.is_ignored(room_id, topic_id):
+            return False
+        await self.db.execute(
+            "INSERT INTO ignored_topic (room_id, topic_id, title) VALUES ($1, $2, $3)",
+            room_id,
+            topic_id,
+            title,
+        )
+        return True
+
+    async def unignore_topic(self, room_id: RoomID, topic_id: int) -> bool:
+        """Remove ``topic_id`` from the ignore list; return False if it was not there."""
+        if not await self.is_ignored(room_id, topic_id):
+            return False
+        await self.db.execute(
+            "DELETE FROM ignored_topic WHERE room_id=$1 AND topic_id=$2", room_id, topic_id
+        )
+        return True
+
+    async def ignored_topics(self, room_id: RoomID) -> list[tuple[int, str]]:
+        rows = await self.db.fetch(
+            "SELECT topic_id, title FROM ignored_topic WHERE room_id=$1 ORDER BY topic_id",
+            room_id,
+        )
+        return [(row["topic_id"], row["title"]) for row in rows]

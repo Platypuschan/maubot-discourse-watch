@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from html import escape
 from typing import Awaitable, Callable
+from urllib.parse import urlparse
 
 from mautrix.types import EventID, Format, MessageType, RoomID, TextMessageEventContent
 
@@ -28,6 +30,22 @@ class MirrorSettings:
     backfill_posts_per_topic: int = 5
     max_post_chars: int = 20000
     max_pages_per_poll: int = 10
+
+
+def parse_topic_ref(value: str) -> int | None:
+    """Topic id from ``123`` or a topic/post URL such as ``…/t/some-slug/123/4``."""
+    value = value.strip()
+    if re.fullmatch(r"#?\d+", value):
+        return int(value.lstrip("#"))
+    parts = [p for p in urlparse(value).path.split("/") if p]
+    if "t" not in parts:
+        return None
+    rest = parts[parts.index("t") + 1 :]
+    # /t/<id>[/<post>] or /t/<slug>/<id>[/<post>]
+    for candidate in rest[:2]:
+        if candidate.isdigit():
+            return int(candidate)
+    return None
 
 
 class Mirror:
@@ -92,6 +110,8 @@ class Mirror:
         return sent
 
     async def backfill_topic(self, topic_id: int, cursor: int) -> int:
+        if await self.store.is_ignored(self.settings.room_id, topic_id):
+            return 0
         topic, posts, total = await self.client.topic_posts(
             topic_id, self.settings.backfill_posts_per_topic
         )
@@ -124,6 +144,8 @@ class Mirror:
         room_id = self.settings.room_id
         if await self.store.is_sent(room_id, post.id):
             return 0
+        if await self.store.is_ignored(room_id, post.topic_id):
+            return 0
         thread = await self.store.get_topic(room_id, post.topic_id)
         if thread is None:
             topic = Topic(post.topic_id, post.topic_title, post.topic_slug, post.category_id)
@@ -131,6 +153,32 @@ class Mirror:
             thread = await self.create_thread(topic, first)
             return 1 if first else 1 + await self.send_post(thread, post)
         return await self.send_post(thread, post)
+
+    async def ignore(self, topic_id: int) -> bool:
+        """Stop mirroring ``topic_id``; its thread stays and is used again after unignore."""
+        thread = await self.store.get_topic(self.settings.room_id, topic_id)
+        return await self.store.ignore_topic(
+            self.settings.room_id, topic_id, thread.title if thread else ""
+        )
+
+    async def unignore(self, topic_id: int) -> bool:
+        return await self.store.unignore_topic(self.settings.room_id, topic_id)
+
+    async def thread_of_event(self, event_id: EventID) -> TopicThread | None:
+        return await self.store.get_topic_by_root(self.settings.room_id, event_id)
+
+    async def root_redacted(self, event_id: EventID) -> TopicThread | None:
+        """A thread root was deleted in Matrix: ignore its topic and forget the thread.
+
+        Forgetting it means a later unignore starts a new thread instead of
+        replying to the deleted root.
+        """
+        thread = await self.thread_of_event(event_id)
+        if thread is None:
+            return None
+        await self.store.ignore_topic(thread.room_id, thread.topic_id, thread.title)
+        await self.store.delete_topic(thread.room_id, thread.topic_id)
+        return thread
 
     async def create_thread(self, topic: Topic, first: Post | None) -> TopicThread:
         """Send the thread root for ``topic``, including its first post if given."""
