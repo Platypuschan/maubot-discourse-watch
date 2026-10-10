@@ -183,3 +183,24 @@ async def test_redacting_thread_root_deletes_thread(forum, maubot_test_bot, maub
     assert await maubot_plugin.store.get_topic(ROOM, 200) is not None
     assert len(await maubot_plugin.store.thread_events(ROOM, 200)) == 1
     await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_waits_out_rate_limit(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    maubot_plugin.backoff_unit = 0.001
+    original = maubot_test_bot.client.send_message_event
+    failures = []
+
+    async def limited(room_id, event_type, content, txn_id=None, **kwargs):
+        if len(failures) < 3:
+            failures.append(room_id)
+            raise MLimitExceeded(429, "Too Many Requests")
+        return await original(room_id, event_type, content, txn_id, **kwargs)
+
+    maubot_test_bot.client.send_message_event = limited
+    forum.add(post(2, 100, 2))
+    sent = await maubot_plugin.poll_now()
+    assert sent == 2 and len(failures) == 3
+    assert maubot_plugin.last_error is None
+    await maubot_plugin.stop()

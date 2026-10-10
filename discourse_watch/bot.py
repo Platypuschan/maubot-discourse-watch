@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from html import escape
-from typing import Type
+from typing import Awaitable, Callable, Type, TypeVar
 
 from maubot import MessageEvent, Plugin
 from maubot.handlers import command, event
@@ -25,6 +25,9 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 from .db import Store, TopicThread, upgrade_table
 from .discourse import DiscourseClient
 from .mirror import Mirror, MirrorSettings, parse_topic_ref
+
+
+T = TypeVar("T")
 
 
 class Config(BaseProxyConfig):
@@ -51,6 +54,8 @@ class DiscourseWatchBot(Plugin):
     wakeup: asyncio.Event
     last_poll: float | None
     last_error: str | None
+    # Seconds per backoff step; tests make it tiny.
+    backoff_unit: float = 1.0
 
     @classmethod
     def get_config_class(cls) -> Type[BaseProxyConfig]:
@@ -103,8 +108,23 @@ class DiscourseWatchBot(Plugin):
         )
         return Mirror(client, self.store, self.send_message, settings, self.log)
 
+    async def rate_limited(self, call: Callable[[], Awaitable[T]], attempts: int = 8) -> T:
+        """Run a Matrix request, backing off on the homeserver's rate limit.
+
+        mautrix does not retry M_LIMIT_EXCEEDED and drops the response body, so
+        retry_after_ms is not available; wait 1, 2, 4, 8, 16, 30, 30 s instead.
+        """
+        for attempt in range(attempts):
+            try:
+                return await call()
+            except MLimitExceeded:
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(min(2**attempt, 30) * self.backoff_unit)
+        raise AssertionError("unreachable")
+
     async def send_message(self, room_id: RoomID, content: TextMessageEventContent) -> EventID:
-        return await self.client.send_message(room_id, content)
+        return await self.rate_limited(lambda: self.client.send_message(room_id, content))
 
     async def poll_loop(self) -> None:
         while True:
@@ -290,17 +310,10 @@ class DiscourseWatchBot(Plugin):
             params["from"] = data["next_batch"]
         return events
 
-    async def redact(self, room_id: RoomID, event_id: EventID, attempts: int = 5) -> None:
-        """Delete one event, backing off on the homeserver's rate limit (mautrix doesn't)."""
-        for attempt in range(attempts):
-            try:
-                await self.client.redact(room_id, event_id, reason="Forum thread deleted")
-                return
-            except MLimitExceeded:
-                if attempt == attempts - 1:
-                    raise
-                # mautrix drops the response body, so retry_after_ms is not available.
-                await asyncio.sleep(2**attempt)
+    async def redact(self, room_id: RoomID, event_id: EventID) -> None:
+        await self.rate_limited(
+            lambda: self.client.redact(room_id, event_id, reason="Forum thread deleted")
+        )
 
     async def delete_thread(self, thread: TopicThread) -> None:
         """Delete the remaining messages of a thread whose root was deleted.

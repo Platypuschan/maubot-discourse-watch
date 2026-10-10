@@ -276,3 +276,37 @@ def test_backfill_skips_ignored_topics(tmp_path):
         await db.stop()
 
     asyncio.run(run())
+
+
+def test_interrupted_initial_sync_does_not_repeat(tmp_path):
+    async def run():
+        db, forum, matrix, mirror = await make(
+            tmp_path, backfill_topics=2, backfill_posts_per_topic=2
+        )
+        forum.add(post(1, 100, 1), post(2, 300, 1))
+        for n in range(2, 8):
+            forum.add(post(10 + n, 200, n))
+        forum.add(post(9, 200, 1), post(30, 300, 2))
+        send = matrix.send
+
+        async def fail_fourth(room_id, content):
+            if len(matrix.sent) == 3:
+                matrix.send = send
+                mirror.send = send
+                raise RuntimeError("Too Many Requests")
+            return await send(room_id, content)
+
+        mirror.send = fail_fourth
+        try:
+            await mirror.poll()
+        except RuntimeError:
+            pass
+        assert len(matrix.sent) == 3 and await mirror.get_cursor() is None
+        await mirror.poll()
+        bodies = [c.body for _, c in matrix.sent]
+        assert sum("earlier posts not mirrored" in b for b in bodies) == 1
+        assert len(bodies) == 6 and "post 17" in bodies[3]
+        assert await mirror.get_cursor() == 30
+        await db.stop()
+
+    asyncio.run(run())

@@ -122,12 +122,14 @@ class Mirror:
         sent = 0
         thread = await self.store.get_topic(self.settings.room_id, topic.id)
         first = posts[0] if posts[0].post_number == 1 else None
-        if thread is None:
+        new_thread = thread is None
+        if new_thread:
             thread = await self.create_thread(topic, first)
             sent += 1
         replies = [p for p in posts if p is not first]
         skipped = total - len(replies) - (1 if first else 0)
-        if replies and skipped > 0:
+        # Only for a new thread: a retried initial sync must not repeat the notice.
+        if new_thread and replies and skipped > 0:
             await self.send_notice(
                 thread,
                 f"… {skipped} earlier post{'s' if skipped != 1 else ''} not mirrored",
