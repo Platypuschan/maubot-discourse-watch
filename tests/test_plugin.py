@@ -353,3 +353,50 @@ async def test_power_level_change_triggers_cleanup(forum, maubot_test_bot, maubo
     await maubot_plugin.cleanup_task
     assert requests == []
     await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_start_leaves_no_handlers(maubot_test_bot, maubot_plugin_meta):
+    """A config maubot cannot parse must not leave a half-started plugin behind."""
+    from pathlib import Path
+
+    import aiohttp
+    from maubot.standalone.loader import FileSystemLoader
+    from mautrix.util.config import RecursiveDict
+    from mautrix.util.logging import TraceLogger
+    from ruamel.yaml import YAML
+
+    base = RecursiveDict(YAML().load(Path("base-config.yaml").read_text()))
+
+    def broken():
+        return YAML().load("admins: [@alice:example.org]\n")
+
+    client = maubot_test_bot.client
+    before = {t: list(h) for t, h in client.event_handlers.items()}
+    async with aiohttp.ClientSession() as http:
+        plugin = DiscourseWatchBot(
+            client=client, loop=asyncio.get_running_loop(), http=http, instance_id="broken",
+            log=TraceLogger("test"), config=Config(broken, lambda: base, lambda c: None),
+            database=None, webapp=None, webapp_url=None,
+            loader=FileSystemLoader(Path("."), maubot_plugin_meta),
+        )
+        with pytest.raises(Exception, match="cannot start any token"):
+            await plugin.internal_start()
+    assert {t: list(h) for t, h in client.event_handlers.items()} == before
+
+    # Even if a handler is still called, it treats the plugin as not configured.
+    redaction = RedactionEvent(
+        type=EventType.ROOM_REDACTION, room_id=ROOM, event_id=EventID("$redact"),
+        sender=UserID("@admin:example.com"), timestamp=0,
+        content=RedactionEventContent(), redacts=EventID("$root"),
+    )
+    await plugin.on_redaction(redaction)
+    power_levels = StateEvent(
+        type=EventType.ROOM_POWER_LEVELS, room_id=ROOM, event_id=EventID("$pl"),
+        sender=UserID("@admin:example.com"), timestamp=0, state_key="",
+        content=PowerLevelStateEventContent(),
+    )
+    await plugin.on_power_levels(power_levels)
+    assert await plugin.poll_now() == 0
+    await maubot_test_bot.send("!forum status", room_id=ROOM)
+    assert maubot_test_bot.responded == []

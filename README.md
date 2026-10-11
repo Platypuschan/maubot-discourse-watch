@@ -57,6 +57,11 @@ The plugin needs maubot ≥ 0.4 and stores its state in the instance database
 
 Changing `room_id` starts a fresh mirror (with backfill) in the new room.
 
+Quote Matrix IDs in the config: YAML does not allow a bare `@` or `!` at the
+start of a value, so write `admins: ["@alice:example.org"]` and
+`room_id: "!abc:example.org"`. Otherwise maubot cannot load the config and the
+instance does not start.
+
 ## Commands
 
 * `!forum status` – forum, room, last processed post, number of mirrored topics,

@@ -26,6 +26,8 @@ user_agent: maubot-discourse-watch (+https://github.com/Platypuschan/maubot-disc
 # Command prefix, e.g. "!forum status".
 command_prefix: forum
 # Matrix user IDs allowed to run "!forum poll". Empty = everyone in the room.
+# Quote the IDs: YAML does not allow a bare "@" or "!" at the start of a value,
+# e.g. admins: ["@alice:example.org"] and room_id: "!abc:example.org".
 admins: []
 # Show URL previews for the bot's messages. When false, every message carries the
 # MSC4095 opt-out ("com.beeper.linkpreviews": []), so Element (1.12.30 and later)
