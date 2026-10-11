@@ -54,14 +54,16 @@ class Config(BaseProxyConfig):
 
 class DiscourseWatchBot(Plugin):
     store: Store
-    mirror: Mirror | None
-    poll_task: asyncio.Task | None
     poll_lock: asyncio.Lock
     wakeup: asyncio.Event
-    last_poll: float | None
-    last_error: str | None
     cleanup_lock: asyncio.Lock
-    cleanup_task: asyncio.Task | None
+    # Defaults so handlers see "not configured" until start() has run: maubot
+    # registers them before calling start().
+    mirror: Mirror | None = None
+    poll_task: asyncio.Task | None = None
+    cleanup_task: asyncio.Task | None = None
+    last_poll: float | None = None
+    last_error: str | None = None
     # Seconds per backoff step; tests make it tiny.
     backoff_unit: float = 1.0
 
@@ -74,6 +76,18 @@ class DiscourseWatchBot(Plugin):
         return upgrade_table
 
     async def start(self) -> None:
+        try:
+            await self.start_mirror()
+        except Exception:
+            # maubot leaves the handlers of a plugin whose start failed registered
+            # and creates a new plugin object on the next start; without this the
+            # failed object keeps receiving events until maubot restarts.
+            for func, event_type in self._handlers_at_startup:
+                self.client.remove_event_handler(event_type, func)
+            await self.stop()
+            raise
+
+    async def start_mirror(self) -> None:
         self.config.load_and_update()
         self.store = Store(self.database)
         self.poll_lock = asyncio.Lock()
