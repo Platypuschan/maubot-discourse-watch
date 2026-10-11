@@ -5,7 +5,7 @@ from mautrix.types import EventID, RelationType, RoomID
 from mautrix.util.async_db import Database
 
 from discourse_watch.db import Store, upgrade_table
-from discourse_watch.discourse import DiscourseClient
+from discourse_watch.discourse import DiscourseClient, DiscourseError
 from discourse_watch.mirror import Mirror, MirrorSettings
 
 BASE = "https://forum.example.org"
@@ -115,8 +115,8 @@ def test_new_topic_and_replies_go_into_thread(tmp_path):
         (root200, c0), (r1, c1), (root100, c2), (r2, c3) = matrix.sent
         assert thread_of(c0) is None and "post 2" in c0.body and "Topic 200" in c0.body
         assert thread_of(c1) == root200 and "↩ #1" in c1.body
-        # Topic 100 started before the bot: header-only root, then the post in its thread.
-        assert thread_of(c2) is None and "post 1" not in c2.body
+        # Topic 100 started before the bot: its opening post is loaded into the root.
+        assert thread_of(c2) is None and "post 1" in c2.body and "started by" in c2.body
         assert thread_of(c3) == root100 and "post 4" in c3.body
         # Reply fallback points at the latest event in the thread.
         forum.add(post(5, 200, 3))
@@ -307,6 +307,29 @@ def test_interrupted_initial_sync_does_not_repeat(tmp_path):
         assert sum("earlier posts not mirrored" in b for b in bodies) == 1
         assert len(bodies) == 6 and "post 17" in bodies[3]
         assert await mirror.get_cursor() == 30
+        await db.stop()
+
+    asyncio.run(run())
+
+
+def test_root_without_opening_post_when_forum_fails(tmp_path):
+    async def run():
+        db, forum, matrix, mirror = await make(tmp_path, backfill_topics=0)
+        forum.add(post(1, 100, 1))
+        await mirror.poll()
+        forum.add(post(2, 100, 2))
+        original = forum.get_json
+
+        async def failing(path, params=None):
+            if path.startswith("/t/"):
+                raise DiscourseError("HTTP 500")
+            return await original(path, params)
+
+        forum.get_json = failing
+        assert await mirror.poll() == 2
+        (root, c0), (_, c1) = matrix.sent
+        assert "Topic 100" in c0.body and "post 1" not in c0.body
+        assert thread_of(c1) == root and "post 2" in c1.body
         await db.stop()
 
     asyncio.run(run())

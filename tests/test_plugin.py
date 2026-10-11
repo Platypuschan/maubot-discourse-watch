@@ -8,9 +8,11 @@ from mautrix.errors import MForbidden, MLimitExceeded
 from mautrix.types import (
     EventID,
     EventType,
+    PowerLevelStateEventContent,
     RedactionEvent,
     RedactionEventContent,
     RelationType,
+    StateEvent,
     UserID,
 )
 
@@ -61,6 +63,12 @@ def maubot_test_bot(maubot_test_bot):
         return EventID(f"$e{len(maubot_test_bot.responded)}")
 
     maubot_test_bot.client.send_message_event = send
+
+    # No real homeserver: the startup cleanup finds no threads.
+    async def request(method, path, query_params=None, **kwargs):
+        return {"chunk": []}
+
+    maubot_test_bot.client.api.request = request
     return maubot_test_bot
 
 
@@ -238,3 +246,110 @@ class TestUrlPreviewsEnabled:
         assert len(maubot_test_bot.responded) == 3
         assert all(link_previews(e) is None for e in maubot_test_bot.responded)
         await maubot_plugin.stop()
+
+
+def threads_api(threads, relations):
+    """Fake ``/threads`` and ``/relations`` answers; records the requested paths."""
+    requests = []
+
+    async def request(method, path, query_params=None, **kwargs):
+        path = str(path)
+        requests.append(path)
+        if path.endswith("/threads"):
+            return {"chunk": threads}
+        for root, events in relations.items():
+            if "/relations/" + root.replace("$", "%24") in path:
+                return {"chunk": [{"event_id": e} for e in events]}
+        raise AssertionError(path)
+
+    return request, requests
+
+
+def deleted_root(event_id, sender):
+    return {"event_id": event_id, "sender": sender, "unsigned": {"redacted_because": {}}}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_empties_leftover_deleted_threads(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    forum.add(post(2, 100, 2))
+    await maubot_test_bot.send("!forum poll", room_id=ROOM)
+    known = (await maubot_plugin.store.get_topic(ROOM, 100)).root_event_id
+    bot = maubot_test_bot.client.mxid
+    request, _ = threads_api(
+        [
+            # Root deleted long ago; the topic is already forgotten, a user reply is left.
+            deleted_root("$old-root", bot),
+            # Root deleted while the bot was offline; the topic is still known.
+            deleted_root(known, bot),
+            # Not deleted, or not the bot's thread: left alone.
+            {"event_id": "$live-root", "sender": bot, "unsigned": {}},
+            deleted_root("$someone-else", "@user:example.com"),
+        ],
+        {"$old-root": ["$user-reply"], known: ["$e2"]},
+    )
+    redacted = []
+
+    async def redact(room_id, event_id, reason=None, **kwargs):
+        redacted.append(event_id)
+        return EventID(f"$redaction-{event_id}")
+
+    maubot_test_bot.client.api.request = request
+    maubot_test_bot.client.redact = redact
+    await maubot_test_bot.send("!forum cleanup", room_id=ROOM)
+    assert "Cleaned up 2 deleted thread(s): 2 message(s) deleted." in (
+        maubot_test_bot.responded[-1].content.body
+    )
+    assert sorted(redacted) == ["$e2", "$user-reply"]
+    assert await maubot_plugin.store.is_ignored(ROOM, 100)
+    assert await maubot_plugin.store.get_topic(ROOM, 100) is None
+    await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_missing_power_level(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    request, _ = threads_api(
+        [deleted_root("$old-root", maubot_test_bot.client.mxid)], {"$old-root": ["$user-reply"]}
+    )
+
+    async def redact(room_id, event_id, reason=None, **kwargs):
+        raise MForbidden(403, "not allowed")
+
+    maubot_test_bot.client.api.request = request
+    maubot_test_bot.client.redact = redact
+    await maubot_test_bot.send("!forum cleanup", room_id=ROOM)
+    answer = maubot_test_bot.responded[-1].content.body
+    assert "0 message(s) deleted" in answer and "1 message(s) of other users" in answer
+    await maubot_plugin.stop()
+
+
+@pytest.mark.asyncio
+async def test_power_level_change_triggers_cleanup(forum, maubot_test_bot, maubot_plugin):
+    await wait_synced(maubot_plugin)
+    request, requests = threads_api(
+        [deleted_root("$old-root", maubot_test_bot.client.mxid)], {"$old-root": ["$user-reply"]}
+    )
+    redacted = []
+
+    async def redact(room_id, event_id, reason=None, **kwargs):
+        redacted.append(event_id)
+        return EventID("$r")
+
+    maubot_test_bot.client.api.request = request
+    maubot_test_bot.client.redact = redact
+    power_levels = StateEvent(
+        type=EventType.ROOM_POWER_LEVELS, room_id=ROOM, event_id=EventID("$pl"),
+        sender=UserID("@admin:example.com"), timestamp=0, state_key="",
+        content=PowerLevelStateEventContent(users={maubot_test_bot.client.mxid: 50}),
+    )
+    await maubot_test_bot.dispatch(EventType.ROOM_POWER_LEVELS, power_levels)
+    await maubot_plugin.cleanup_task
+    assert redacted == ["$user-reply"]
+    # Power levels of other rooms are ignored.
+    power_levels.room_id = "!other:example.com"
+    requests.clear()
+    await maubot_test_bot.dispatch(EventType.ROOM_POWER_LEVELS, power_levels)
+    await maubot_plugin.cleanup_task
+    assert requests == []
+    await maubot_plugin.stop()

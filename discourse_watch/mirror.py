@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from mautrix.types import EventID, Format, MessageType, RoomID, TextMessageEventContent
 
 from .db import Store, TopicThread
-from .discourse import Category, DiscourseClient, Post, Topic
+from .discourse import Category, DiscourseClient, DiscourseError, Post, Topic
 from .render import render_post
 
 Sender = Callable[[RoomID, TextMessageEventContent], Awaitable[EventID]]
@@ -151,10 +151,25 @@ class Mirror:
         thread = await self.store.get_topic(room_id, post.topic_id)
         if thread is None:
             topic = Topic(post.topic_id, post.topic_title, post.topic_slug, post.category_id)
-            first = post if post.post_number == 1 else None
+            if post.post_number == 1:
+                await self.create_thread(topic, post)
+                return 1
+            # The topic started before the bot saw it: put its opening post into
+            # the root, so the thread does not start with a bare title.
+            topic, first = await self.opening_post(topic)
             thread = await self.create_thread(topic, first)
-            return 1 if first else 1 + await self.send_post(thread, post)
+            return 1 + await self.send_post(thread, post)
         return await self.send_post(thread, post)
+
+    async def opening_post(self, topic: Topic) -> tuple[Topic, Post | None]:
+        """The topic (with forum metadata) and its first post, if it can be loaded."""
+        try:
+            loaded, posts, _ = await self.client.topic_posts(topic.id, 0)
+        except DiscourseError as e:
+            self.log.warning(f"Could not load the first post of topic {topic.id}: {e}")
+            return topic, None
+        first = next((p for p in posts if p.post_number == 1 and p.visible), None)
+        return loaded, first
 
     async def ignore(self, topic_id: int) -> bool:
         """Stop mirroring ``topic_id``; its thread stays and is used again after unignore."""

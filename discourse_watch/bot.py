@@ -17,6 +17,7 @@ from mautrix.types import (
     RedactionEvent,
     RelationType,
     RoomID,
+    StateEvent,
     TextMessageEventContent,
 )
 from mautrix.util.async_db import UpgradeTable
@@ -59,6 +60,8 @@ class DiscourseWatchBot(Plugin):
     wakeup: asyncio.Event
     last_poll: float | None
     last_error: str | None
+    cleanup_lock: asyncio.Lock
+    cleanup_task: asyncio.Task | None
     # Seconds per backoff step; tests make it tiny.
     backoff_unit: float = 1.0
 
@@ -77,17 +80,22 @@ class DiscourseWatchBot(Plugin):
         self.wakeup = asyncio.Event()
         self.last_poll = None
         self.last_error = None
+        self.cleanup_lock = asyncio.Lock()
         self.mirror = self.build_mirror()
         self.poll_task = asyncio.create_task(self.poll_loop())
+        # Threads deleted while the bot was offline or lacked the power level.
+        self.cleanup_task = asyncio.create_task(self.cleanup_quietly())
 
     async def stop(self) -> None:
-        if self.poll_task:
-            self.poll_task.cancel()
-            try:
-                await self.poll_task
-            except asyncio.CancelledError:
-                pass
-            self.poll_task = None
+        for name in ("poll_task", "cleanup_task"):
+            task = getattr(self, name, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, name, None)
 
     def on_external_config_update(self) -> None:
         self.config.load_and_update()
@@ -213,6 +221,31 @@ class DiscourseWatchBot(Plugin):
         else:
             await self.reply(evt, f"Poll done, {sent} message(s) sent.")
 
+    @forum.subcommand("cleanup", help="Remove what is left of deleted threads")
+    async def cleanup_command(self, evt: MessageEvent) -> None:
+        if self.mirror is None:
+            await self.reply(evt, "Not configured: set `room_id` in the plugin config.")
+            return
+        if not self.is_admin(evt):
+            await self.reply(evt, "You are not allowed to do that.")
+            return
+        try:
+            threads, deleted, forbidden = await self.cleanup()
+        except Exception as e:
+            self.log.exception("Cleanup failed")
+            await self.reply(evt, f"Cleanup failed: {type(e).__name__}: {e}")
+            return
+        if not threads:
+            await self.reply(evt, "No leftovers of deleted threads found.")
+            return
+        text = f"Cleaned up {threads} deleted thread(s): {deleted} message(s) deleted."
+        if forbidden:
+            text += (
+                f" {forbidden} message(s) of other users could not be deleted: the bot "
+                "needs a power level that may delete other users' messages (e.g. moderator)."
+            )
+        await self.reply(evt, text)
+
     async def topic_from_command(self, evt: MessageEvent, value: str) -> int | None:
         """Topic named in the command, or the topic of the thread it was sent in."""
         if value.strip():
@@ -334,11 +367,11 @@ class DiscourseWatchBot(Plugin):
             lambda: self.client.redact(room_id, event_id, reason="Forum thread deleted")
         )
 
-    async def delete_thread(self, thread: TopicThread) -> None:
+    async def delete_thread(self, thread: TopicThread) -> tuple[int, int]:
         """Delete the remaining messages of a thread whose root was deleted.
 
         The bot can always delete its own messages; other users' replies need a
-        power level that allows deleting them.
+        power level that allows deleting them. Returns ``(deleted, forbidden)``.
         """
         events = set(await self.store.thread_events(thread.room_id, thread.topic_id))
         try:
@@ -346,19 +379,99 @@ class DiscourseWatchBot(Plugin):
         except Exception as e:
             self.log.warning(f"Could not list thread of topic {thread.topic_id}: {e}")
         events.discard(thread.root_event_id)
+        result = await self.redact_all(thread.room_id, events, f"topic {thread.topic_id}")
+        await self.store.forget_thread_events(thread.room_id, thread.topic_id)
+        return result
+
+    async def redact_all(
+        self, room_id: RoomID, events: set[EventID], label: str
+    ) -> tuple[int, int]:
         deleted = forbidden = failed = 0
         for event_id in sorted(events):
             try:
-                await self.redact(thread.room_id, event_id)
+                await self.redact(room_id, event_id)
                 deleted += 1
             except MForbidden:
                 forbidden += 1
             except Exception as e:
                 failed += 1
                 self.log.warning(f"Could not delete {event_id}: {e}")
-        await self.store.forget_thread_events(thread.room_id, thread.topic_id)
         self.log.info(
-            f"Deleted {deleted} message(s) of topic {thread.topic_id}"
+            f"Deleted {deleted} message(s) of {label}"
             + (f", {forbidden} not allowed (bot lacks power level)" if forbidden else "")
             + (f", {failed} failed" if failed else "")
         )
+        return deleted, forbidden
+
+    async def deleted_thread_roots(self, room_id: RoomID) -> list[EventID]:
+        """Deleted roots of the bot's threads that still have messages in them.
+
+        The homeserver keeps a thread in the room's thread list as long as any
+        message of it is left, even when the root is gone.
+        """
+        path = Path.v1.rooms[room_id].threads
+        roots: list[EventID] = []
+        params = {"include": "all", "limit": "50"}
+        for _ in range(100):
+            data = await self.client.api.request(Method.GET, path, query_params=params)
+            for root in data.get("chunk", []):
+                if root.get("sender") == self.client.mxid and "redacted_because" in root.get(
+                    "unsigned", {}
+                ):
+                    roots.append(EventID(root["event_id"]))
+            if not data.get("next_batch"):
+                break
+            params["from"] = data["next_batch"]
+        return roots
+
+    async def cleanup(self) -> tuple[int, int, int]:
+        """Empty the threads whose root was deleted, so they leave the thread list.
+
+        Covers roots deleted while the bot was offline and replies the bot was
+        not allowed to delete before it got a higher power level. Returns
+        ``(threads, deleted, forbidden)``.
+        """
+        mirror = self.mirror
+        if mirror is None:
+            return 0, 0, 0
+        room_id = mirror.settings.room_id
+        threads = deleted = forbidden = 0
+        async with self.cleanup_lock:
+            for root in await self.deleted_thread_roots(room_id):
+                async with self.poll_lock:
+                    known = await mirror.root_redacted(root)
+                if known:
+                    self.log.info(f"Thread root of topic {known.topic_id} was deleted, topic ignored")
+                    d, f = await self.delete_thread(known)
+                else:
+                    events = await self.thread_relations(room_id, root)
+                    events.discard(root)
+                    d, f = await self.redact_all(room_id, events, f"deleted thread {root}")
+                threads += 1
+                deleted += d
+                forbidden += f
+        return threads, deleted, forbidden
+
+    async def cleanup_quietly(self) -> None:
+        try:
+            threads, deleted, forbidden = await self.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log.warning(f"Cleanup of deleted threads failed: {type(e).__name__}: {e}")
+            return
+        if threads:
+            self.log.info(
+                f"Cleaned up {threads} deleted thread(s): {deleted} deleted, "
+                f"{forbidden} not allowed"
+            )
+
+    @event.on(EventType.ROOM_POWER_LEVELS)
+    async def on_power_levels(self, evt: StateEvent) -> None:
+        """The bot may have been allowed to delete other users' messages: clean up again."""
+        mirror = self.mirror
+        if mirror is None or evt.room_id != mirror.settings.room_id:
+            return
+        if self.cleanup_task and not self.cleanup_task.done():
+            return
+        self.cleanup_task = asyncio.create_task(self.cleanup_quietly())

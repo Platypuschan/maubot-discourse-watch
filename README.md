@@ -67,8 +67,9 @@ Changing `room_id` starts a fresh mirror (with backfill) in the new room.
 * `!forum unignore <topic>` – mirror an ignored topic again, starting with its
   next new post (posts written in the meantime are not sent).
 * `!forum ignored` – list the ignored topics.
+* `!forum cleanup` – remove what is left of deleted threads (see below).
 
-`ignore` and `unignore` follow the `admins` setting, like `poll`.
+`ignore`, `unignore` and `cleanup` follow the `admins` setting, like `poll`.
 
 ### Deleting a thread
 
@@ -83,6 +84,13 @@ no new posts of that topic any more.
   bot itself has that power level in the room; otherwise they stay and the bot
   logs how many it could not delete.
 * If you `unignore` such a topic later, its next post starts a new thread.
+
+A thread stays in the room's thread list (as "Message deleted") as long as any
+message of it is left. When the bot could not delete everything, e.g. because
+it was not a moderator yet, it cleans up later: on every start, whenever the
+room's power levels change (so promoting the bot to moderator is enough), and
+on `!forum cleanup`. The cleanup also catches thread roots deleted while the
+bot was offline. It only touches threads whose root the bot sent.
 
 ## Limitations
 
